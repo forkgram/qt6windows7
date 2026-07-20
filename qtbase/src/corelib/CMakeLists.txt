@@ -16,7 +16,11 @@ qt_internal_extend_sbom(WrapZLIB::WrapZLIB
 
 if(ANDROID)
     set(corelib_extra_cmake_files
-        "${CMAKE_CURRENT_SOURCE_DIR}/${QT_CMAKE_EXPORT_NAMESPACE}AndroidMacros.cmake")
+        "${CMAKE_CURRENT_SOURCE_DIR}/${QT_CMAKE_EXPORT_NAMESPACE}AndroidMacros.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/${QT_CMAKE_EXPORT_NAMESPACE}AndroidDynamicFeatureHelpers.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/${QT_CMAKE_EXPORT_NAMESPACE}AndroidGradleHelpers.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/${QT_CMAKE_EXPORT_NAMESPACE}AndroidPermissionHelpers.cmake"
+    )
 endif()
 if(WASM)
     set(corelib_extra_cmake_files
@@ -98,6 +102,7 @@ qt_internal_add_module(Core
         global/qvolatile_p.h
         global/q17memory.h
         global/q20algorithm.h
+        global/q20bit.h
         global/q20chrono.h
         global/q20functional.h
         global/q20iterator.h
@@ -168,12 +173,14 @@ qt_internal_add_module(Core
         kernel/qelapsedtimer.cpp kernel/qelapsedtimer.h
         kernel/qeventloop.cpp kernel/qeventloop.h kernel/qeventloop_p.h
         kernel/qfunctions_p.h
-        kernel/qiterable.cpp kernel/qiterable.h kernel/qiterable_p.h
+        kernel/qiterable.cpp kernel/qiterable.h kernel/qiterable_impl.h
         kernel/qmath.cpp kernel/qmath.h
+        kernel/qmetaassociation.cpp kernel/qmetaassociation.h
         kernel/qmetacontainer.cpp kernel/qmetacontainer.h
         kernel/qmetaobject.cpp kernel/qmetaobject.h kernel/qmetaobject_p.h
         kernel/qmetaobject_moc_p.h
         kernel/qmetaobjectbuilder.cpp kernel/qmetaobjectbuilder_p.h
+        kernel/qmetasequence.cpp kernel/qmetasequence.h
         kernel/qmetatype.cpp kernel/qmetatype.h kernel/qmetatype_p.h
         kernel/qmimedata.cpp kernel/qmimedata.h
         kernel/qtmetamacros.h kernel/qtmocconstants.h kernel/qtmochelpers.h
@@ -224,7 +231,6 @@ qt_internal_add_module(Core
         text/qbytearraylist.cpp text/qbytearraylist.h
         text/qbytearraymatcher.cpp text/qbytearraymatcher.h
         text/qbytearrayview.h
-        text/qbytedata_p.h
         text/qchar.h
         text/qcollator.cpp text/qcollator.h text/qcollator_p.h
         text/qdoublescanprint_p.h
@@ -253,6 +259,7 @@ qt_internal_add_module(Core
         text/qvsnprintf.cpp
         thread/qatomic.h
         thread/qatomic_cxx11.h
+        thread/qatomicwait.cpp thread/qatomicwait_p.h
         thread/qbasicatomic.h
         thread/qgenericatomic.h
         thread/qlocking_p.h
@@ -304,6 +311,7 @@ qt_internal_add_module(Core
         tools/qoffsetstringarray_p.h
         tools/qpair.h
         tools/qpoint.cpp tools/qpoint.h
+        tools/qquasivirtual_impl.h
         tools/qqueue.h
         tools/qrect.cpp tools/qrect.h
         tools/qrefcount.cpp tools/qrefcount.h
@@ -390,6 +398,11 @@ _qt_internal_setup_deploy_support()
 
 add_dependencies(Core qmodule_pri)
 
+qt_internal_extend_target(Core CONDITION CMAKE_PROJECT_VERSION VERSION_LESS "7.0"
+    SOURCES
+        text/qstringconverter_base_deprecated.h
+)
+
 if (NOT QT_NAMESPACE STREQUAL "")
     set(core_namespace_defs "QT_NAMESPACE=${QT_NAMESPACE}")
     if(QT_INLINE_NAMESPACE)
@@ -398,6 +411,9 @@ if (NOT QT_NAMESPACE STREQUAL "")
     target_compile_definitions(Core PUBLIC ${core_namespace_defs})
     set_target_properties(Core PROPERTIES _qt_namespace "${QT_NAMESPACE}")
     set_property(TARGET Core APPEND PROPERTY EXPORT_PROPERTIES _qt_namespace)
+
+    set_target_properties(Core PROPERTIES QT_NAMESPACE "${QT_NAMESPACE}")
+    set_property(TARGET Core APPEND PROPERTY EXPORT_PROPERTIES QT_NAMESPACE)
 endif()
 
 qt_generate_qconfig_cpp(global/qconfig.cpp.in global/qconfig.cpp)
@@ -484,8 +500,11 @@ if(ANDROID)
     set_property(TARGET Core APPEND PROPERTY QT_ANDROID_LIB_DEPENDENCIES
         ${INSTALL_PLUGINSDIR}/platforms/libplugins_platforms_qtforandroid.so
     )
-    set_property(TARGET Core APPEND PROPERTY QT_ANDROID_PERMISSIONS
-        android.permission.INTERNET android.permission.WRITE_EXTERNAL_STORAGE
+    qt_internal_add_android_permission(Core
+        NAME android.permission.WRITE_EXTERNAL_STORAGE
+    )
+    qt_internal_add_android_permission(Core
+        NAME android.permission.INTERNET
     )
 endif()
 
@@ -552,6 +571,35 @@ qt_internal_extend_target(Core CONDITION QT_FEATURE_animation
         animation/qvariantanimation.cpp animation/qvariantanimation.h animation/qvariantanimation_p.h
 )
 
+if(QT_FEATURE_async_io)
+    qt_internal_extend_target(Core
+        SOURCES
+            io/qiooperation.cpp io/qiooperation_p.h io/qiooperation_p_p.h
+            io/qrandomaccessasyncfile.cpp io/qrandomaccessasyncfile_p.h io/qrandomaccessasyncfile_p_p.h
+    )
+
+    if(APPLE)
+        qt_internal_extend_target(Core
+            SOURCES
+                io/qrandomaccessasyncfile_darwin.mm
+        )
+    elseif((LINUX AND QT_FEATURE_liburing) OR (WIN32 AND QT_FEATURE_windows_ioring))
+        qt_internal_extend_target(Core
+            SOURCES
+                io/qrandomaccessasyncfile_qioring.cpp
+            DEFINES
+                QT_RANDOMACCESSASYNCFILE_QIORING
+        )
+    endif()
+    # This is the fallback condition that should be always available.
+    # TODO: try to rewrite it so that it does not depend on
+    # QT_FEATURE_future.
+    qt_internal_extend_target(Core
+        SOURCES
+            io/qrandomaccessasyncfile_threadpool.cpp
+    )
+endif()
+
 # This needs to be done before one below adds kernel32 because the symbols we use
 # from synchronization also appears in kernel32 in the version of MinGW we use in CI.
 # However, when picking the symbols from libkernel32.a it will try to load the symbols
@@ -596,6 +644,7 @@ qt_internal_extend_target(Core CONDITION WIN32
         platform/windows/qcomptr_p.h
         platform/windows/qbstr_p.h
         platform/windows/qcomvariant_p.h
+        platform/windows/quniquehandle_types_windows.cpp platform/windows/quniquehandle_types_windows_p.h
     LIBRARIES
         advapi32
         authz
@@ -657,6 +706,7 @@ qt_internal_extend_target(Core CONDITION APPLE
         kernel/qcore_mac.mm kernel/qcore_mac_p.h
         kernel/qcoreapplication_mac.cpp
         kernel/qeventdispatcher_cf.mm kernel/qeventdispatcher_cf_p.h
+        platform/darwin/qdarwinsecurityscopedfileengine.mm platform/darwin/qdarwinsecurityscopedfileengine_p.h
     LIBRARIES
         ${FWCoreFoundation}
         ${FWFoundation}
@@ -702,6 +752,18 @@ qt_internal_extend_target(Core CONDITION INTEGRITY
         socket
     COMPILE_OPTIONS
         --pending_instantiations=128
+)
+
+qt_internal_extend_target(Core CONDITION QT_FEATURE_liburing
+    SOURCES
+        io/qioring.cpp io/qioring_linux.cpp io/qioring_p.h
+    LIBRARIES
+        uring
+)
+
+qt_internal_extend_target(Core CONDITION QT_FEATURE_windows_ioring
+    SOURCES
+        io/qioring.cpp io/qioring_win.cpp io/qioring_p.h
 )
 
 # Workaround for QTBUG-101411
@@ -757,6 +819,7 @@ qt_internal_extend_target(Core CONDITION QT_FEATURE_thread
     SOURCES
         thread/qatomic.cpp
         thread/qfutex_p.h
+        thread/qlatch.cpp thread/qlatch_p.h
         thread/qmutex.cpp thread/qmutex_p.h
         thread/qreadwritelock.cpp thread/qreadwritelock_p.h
         thread/qthreadstorage.cpp thread/qthreadstorage_p.h
@@ -898,7 +961,7 @@ qt_internal_extend_target(Core CONDITION WASM
 
 qt_internal_extend_target(Core CONDITION MSVC AND CLANG
     LIBRARIES
-        clang_rt.builtins-x86_64
+        clang_rt.builtins-$<IF:$<STREQUAL:${TEST_architecture_arch},arm64>,aarch64,x86_64>
 )
 
 qt_internal_extend_target(Core CONDITION QT_FEATURE_icu
@@ -985,7 +1048,7 @@ qt_internal_extend_target(Core
 
 qt_internal_extend_target(Core
     CONDITION
-        QT_FEATURE_timezone AND UNIX
+        QT_FEATURE_timezone AND UNIX AND NOT VXWORKS
         AND NOT ANDROID AND NOT APPLE AND NOT QT_FEATURE_timezone_tzdb
     SOURCES
         time/qtimezoneprivate_tz.cpp
@@ -994,7 +1057,7 @@ qt_internal_extend_target(Core
 qt_internal_extend_target(Core
     CONDITION
         QT_FEATURE_icu AND QT_FEATURE_timezone
-        AND NOT UNIX AND NOT QT_FEATURE_timezone_tzdb
+        AND (VXWORKS OR NOT UNIX) AND NOT QT_FEATURE_timezone_tzdb
     SOURCES
         time/qtimezoneprivate_icu.cpp
 )
@@ -1171,6 +1234,7 @@ qt_internal_extend_target(Core CONDITION QT_FEATURE_itemmodel
         itemmodels/qabstractitemmodel.cpp itemmodels/qabstractitemmodel.h itemmodels/qabstractitemmodel_p.h
         itemmodels/qitemselectionmodel.cpp itemmodels/qitemselectionmodel.h itemmodels/qitemselectionmodel_p.h
         itemmodels/qrangemodel.h itemmodels/qrangemodel_impl.h itemmodels/qrangemodel.cpp
+        itemmodels/qrangemodeladapter.h itemmodels/qrangemodeladapter_impl.h
 )
 
 qt_internal_extend_target(Core CONDITION QT_FEATURE_proxymodel
@@ -1465,10 +1529,12 @@ endif()
 
 qt_internal_extend_target(Core CONDITION WASM
     SOURCES
+        platform/wasm/qwasmanimationdriver.cpp platform/wasm/qwasmanimationdriver_p.h
         platform/wasm/qwasmglobal.cpp platform/wasm/qwasmglobal_p.h
         platform/wasm/qstdweb.cpp platform/wasm/qstdweb_p.h
         platform/wasm/qwasmsocket.cpp platform/wasm/qwasmsocket_p.h
         platform/wasm/qwasmsuspendresumecontrol.cpp platform/wasm/qwasmsuspendresumecontrol_p.h
+        platform/wasm/qwasmlocalfileengine.cpp platform/wasm/qwasmlocalfileengine_p.h
         kernel/qeventdispatcher_wasm.cpp kernel/qeventdispatcher_wasm_p.h
 )
 
@@ -1638,6 +1704,6 @@ function(qt_internal_library_deprecation_level)
 endfunction()
 qt_internal_library_deprecation_level()
 
-if(QT_FEATURE_doc_snippets)
+if(QT_BUILD_DOC_SNIPPETS)
     add_subdirectory(doc/snippets)
 endif()

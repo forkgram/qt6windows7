@@ -1,5 +1,6 @@
 // Copyright (C) 2016 The Qt Company Ltd.
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+// Qt-Security score:significant reason:default
 
 #include <QtCore/qt_windows.h>
 #include <QtGui/qstylehints.h>
@@ -23,6 +24,8 @@
 #ifdef QT_NO_CURSOR
 #  include "qwindowscursor.h"
 #endif
+#include "qwindowswindowclassdescription.h"
+#include "qwindowswindowclassregistry.h"
 
 #include <QtGui/qguiapplication.h>
 #include <QtGui/qscreen.h>
@@ -44,7 +47,6 @@
 #include <QtCore/qoperatingsystemversion.h>
 
 #include <dwmapi.h>
-#include <gdiplus.h>
 
 #if QT_CONFIG(vulkan)
 #include "qwindowsvulkaninstance.h"
@@ -59,6 +61,8 @@
 #endif
 
 QT_BEGIN_NAMESPACE
+
+using namespace Qt::StringLiterals;
 
 using QWindowCreationContextPtr = QSharedPointer<QWindowCreationContext>;
 
@@ -849,7 +853,7 @@ void WindowCreationData::fromWindow(const QWindow *w, const Qt::WindowFlags flag
         // make mouse events fall through this window
         // NOTE: WS_EX_TRANSPARENT flag can make mouse inputs fall through a layered window
         if (flagsIn & Qt::WindowTransparentForInput)
-            exStyle |= WS_EX_LAYERED | WS_EX_TRANSPARENT;
+            exStyle |= WS_EX_TRANSPARENT;
 
         // Currently only compatible with D3D surfaces, use it with care.
         if (qEnvironmentVariableIntValue("QT_QPA_DISABLE_REDIRECTION_SURFACE"))
@@ -889,8 +893,13 @@ QWindowsWindowData
 
     const auto appinst = reinterpret_cast<HINSTANCE>(GetModuleHandle(nullptr));
 
-    const QString windowClassName = QWindowsContext::instance()->registerWindowClass(w);
-    const QString windowTitlebarName = QWindowsContext::instance()->registerWindowClass(QStringLiteral("_q_titlebar"), DefWindowProc, CS_VREDRAW|CS_HREDRAW, nullptr, false);
+    const QString windowClassName = QWindowsWindowClassRegistry::instance()->registerWindowClass(w);
+
+    QWindowsWindowClassDescription windowTitlebarDescription;
+    windowTitlebarDescription.name = "_q_titlebar"_L1;
+    windowTitlebarDescription.style = CS_VREDRAW | CS_HREDRAW;
+    windowTitlebarDescription.shouldAddPrefix = false;
+    const QString windowTitlebarName = QWindowsWindowClassRegistry::instance()->registerWindowClass(windowTitlebarDescription);
 
     const QScreen *screen{};
     const QRect rect = QPlatformWindow::initialGeometry(w, data.geometry,
@@ -1610,9 +1619,6 @@ QWindowsWindow::QWindowsWindow(QWindow *aWindow, const QWindowsWindowData &data)
         ShowWindow(m_data.hwndTitlebar, SW_SHOW);
     }
 
-    const Qt::WindowType type = aWindow->type();
-    if (type == Qt::Desktop)
-        return; // No further handling for Qt::Desktop
     if (aWindow->surfaceType() == QWindow::Direct3DSurface)
         setFlag(Direct3DSurface);
 #if QT_CONFIG(opengl)
@@ -1666,16 +1672,14 @@ void QWindowsWindow::initialize()
 
     // Trigger geometry change (unless it has a special state in which case setWindowState()
     // will send the message) and screen change signals of QWindow.
-    if (w->type() != Qt::Desktop) {
-        const Qt::WindowState state = w->windowState();
-        const QRect obtainedGeometry(creationContext->obtainedPos, creationContext->obtainedSize);
-        QPlatformScreen *obtainedScreen = screenForGeometry(obtainedGeometry);
-        if (obtainedScreen && screen() != obtainedScreen)
-            QWindowSystemInterface::handleWindowScreenChanged<QWindowSystemInterface::SynchronousDelivery>(w, obtainedScreen->screen());
-        if (state != Qt::WindowMaximized && state != Qt::WindowFullScreen
-            && creationContext->requestedGeometryIn != obtainedGeometry) {
-            QWindowSystemInterface::handleGeometryChange<QWindowSystemInterface::SynchronousDelivery>(w, obtainedGeometry);
-        }
+    const Qt::WindowState state = w->windowState();
+    const QRect obtainedGeometry(creationContext->obtainedPos, creationContext->obtainedSize);
+    QPlatformScreen *obtainedScreen = screenForGeometry(obtainedGeometry);
+    if (obtainedScreen && screen() != obtainedScreen)
+        QWindowSystemInterface::handleWindowScreenChanged<QWindowSystemInterface::SynchronousDelivery>(w, obtainedScreen->screen());
+    if (state != Qt::WindowMaximized && state != Qt::WindowFullScreen
+        && creationContext->requestedGeometryIn != obtainedGeometry) {
+        QWindowSystemInterface::handleGeometryChange<QWindowSystemInterface::SynchronousDelivery>(w, obtainedGeometry);
     }
     if (QWindowsContext::user32dll.getDpiForWindow)
         QWindowsWindow::setSavedDpi(QWindowsContext::user32dll.getDpiForWindow(handle()));
@@ -1736,8 +1740,10 @@ void QWindowsWindow::destroyWindow()
             m_surface = nullptr;
         }
 #endif
+        DestroyWindow(m_data.hwndTitlebar);
         DestroyWindow(m_data.hwnd);
         context->removeWindow(m_data.hwnd);
+        m_data.hwndTitlebar = nullptr;
         m_data.hwnd = nullptr;
     }
 }
@@ -1927,10 +1933,15 @@ void QWindowsWindow::updateTransientParent() const
     // Update transient parent.
     const HWND oldTransientParent = GetWindow(m_data.hwnd, GW_OWNER);
     HWND newTransientParent = nullptr;
-    if (const QWindow *tp = window()->transientParent())
-        if (const QWindowsWindow *tw = QWindowsWindow::windowsWindowOf(tp))
-            if (!tw->testFlag(WithinDestroy)) // Prevent destruction by parent window (QTBUG-35499, QTBUG-36666)
+    if (const QWindow *tp = window()->transientParent()) {
+        if (const QWindowsWindow *tw = QWindowsWindow::windowsWindowOf(tp)) {
+            if (!tw->testFlag(WithinDestroy)) { // Prevent destruction by parent window (QTBUG-35499, QTBUG-36666)
                 newTransientParent = tw->handle();
+            }
+        } else if (const QWindowsBaseWindow *tbw = QWindowsBaseWindow::baseWindowOf(tp)) {
+            newTransientParent = tbw->handle();
+        }
+    }
 
     // QTSOLBUG-71: When using the MFC/winmigrate solution, it is possible that a child
     // window is found, which can cause issues with modality. Loop up to top level.
@@ -2070,7 +2081,14 @@ void QWindowsWindow::setParent_sys(const QPlatformWindow *parent)
         // Force toplevel state as QWindow::isTopLevel cannot be relied upon here.
         if (wasTopLevel != isTopLevel) {
             setDropSiteEnabled(false);
-            setWindowFlags_sys(window()->flags(), unsigned(isTopLevel ? WindowCreationData::ForceTopLevel : WindowCreationData::ForceChild));
+            m_data = setWindowFlags_sys(window()->flags(), unsigned(isTopLevel ? WindowCreationData::ForceTopLevel : WindowCreationData::ForceChild));
+            // Update frame margins for the new top-level state.
+            // Child windows have no frame/titlebar, so margins must be zero.
+            // Top-level windows need frame margins recalculated.
+            if (isTopLevel)
+                updateFullFrameMargins();
+            else
+                m_data.fullFrameMargins = {};
             updateDropSite(isTopLevel);
         }
     }
@@ -2129,7 +2147,8 @@ void QWindowsWindow::handleDpiChanged(HWND hwnd, WPARAM wParam, LPARAM lParam)
     QWindowsThemeCache::clearThemeCache(hwnd);
 
     // Send screen change first, so that the new screen is set during any following resize
-    checkForScreenChanged(QWindowsWindow::FromDpiChange);
+    const auto prcNewWindow = reinterpret_cast<const RECT *>(lParam);
+    checkForScreenChanged(QWindowsWindow::FromDpiChange, !m_inSetgeometry ? prcNewWindow : nullptr);
 
     if (!IsZoomed(hwnd))
         m_data.restoreGeometry.setSize(m_data.restoreGeometry.size() * scale);
@@ -2152,7 +2171,6 @@ void QWindowsWindow::handleDpiChanged(HWND hwnd, WPARAM wParam, LPARAM lParam)
     // making the SetWindowPos() call.
     if (!m_inSetgeometry) {
         updateFullFrameMargins();
-        const auto prcNewWindow = reinterpret_cast<RECT *>(lParam);
         SetWindowPos(hwnd, nullptr, prcNewWindow->left, prcNewWindow->top,
                      prcNewWindow->right - prcNewWindow->left,
                      prcNewWindow->bottom - prcNewWindow->top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2344,6 +2362,7 @@ void QWindowsWindow::handleResized(int wParam, LPARAM lParam)
         return;
     case SIZE_MAXIMIZED:
         handleGeometryChange();
+        updateRestoreGeometry();    // we might be in ResizeMoveActive mode but changed the screen
         if (!testFlag(WithinSetStyle) && !testFlag(WithinSetGeometry))
             handleWindowStateChange(Qt::WindowMaximized | (isFullScreen_sys() ? Qt::WindowFullScreen
                                                                               : Qt::WindowNoState));
@@ -2367,14 +2386,15 @@ static inline bool equalDpi(const QDpi &d1, const QDpi &d2)
     return qFuzzyCompare(d1.first, d2.first) && qFuzzyCompare(d1.second, d2.second);
 }
 
-void QWindowsWindow::checkForScreenChanged(ScreenChangeMode mode)
+void QWindowsWindow::checkForScreenChanged(ScreenChangeMode mode, const RECT *suggestedRect)
 {
     if ((parent() && !parent()->isForeignWindow()) || QWindowsScreenManager::isSingleScreen())
         return;
 
     QPlatformScreen *currentScreen = screen();
     auto topLevel = isTopLevel_sys() ? m_data.hwnd : GetAncestor(m_data.hwnd, GA_ROOT);
-    const QWindowsScreen *newScreen =
+    const QWindowsScreen *newScreen = suggestedRect ?
+        QWindowsContext::instance()->screenManager().screenForRect(suggestedRect) :
         QWindowsContext::instance()->screenManager().screenForHwnd(topLevel);
 
     if (newScreen == nullptr || newScreen == currentScreen)
@@ -2395,8 +2415,8 @@ void QWindowsWindow::checkForScreenChanged(ScreenChangeMode mode)
 void QWindowsWindow::handleGeometryChange()
 {
     const QRect previousGeometry = m_data.geometry;
-    m_data.geometry = geometry_sys();
     updateFullFrameMargins();
+    m_data.geometry = geometry_sys();
     QWindowSystemInterface::handleGeometryChange(window(), m_data.geometry);
     // QTBUG-32121: OpenGL/normal windows (with exception of ANGLE
     // which we no longer support in Qt 6) do not receive expose
@@ -2935,6 +2955,17 @@ void QWindowsWindow::propagateSizeHints()
     qCDebug(lcQpaWindow) << __FUNCTION__ << this << window();
 }
 
+static bool isResize(const WINDOWPOS *windowPos)
+{
+    bool result = false;
+    if ((windowPos->flags & SWP_NOSIZE) == 0) {
+        RECT rect;
+        GetWindowRect(windowPos->hwnd, &rect);
+        result = rect.right - rect.left != windowPos->cx || rect.bottom - rect.top != windowPos->cy;
+    }
+    return result;
+}
+
 bool QWindowsWindow::handleGeometryChangingMessage(MSG *message, const QWindow *qWindow, const QMargins &margins)
 {
     auto *windowPos = reinterpret_cast<WINDOWPOS *>(message->lParam);
@@ -2947,7 +2978,7 @@ bool QWindowsWindow::handleGeometryChangingMessage(MSG *message, const QWindow *
     // Check the suggestedGeometry against the current one to only discard during
     // resize, and not a plain move. We also look for SWP_NOSIZE since that, too,
     // implies an identical size, and comparing QRects wouldn't work with null cx/cy
-    if (!(windowPos->flags & SWP_NOSIZE) && suggestedGeometry.size() != qWindow->geometry().size())
+    if (isResize(windowPos))
         windowPos->flags |= SWP_NOCOPYBITS;
 
     if ((windowPos->flags & SWP_NOZORDER) == 0) {
@@ -3300,6 +3331,7 @@ bool QWindowsWindow::handleNonClientHitTest(const QPoint &globalPos, LRESULT *re
     const QWindow *w = window();
     const QPoint localPos = w->mapFromGlobal(QHighDpi::fromNativePixels(globalPos, w));
     const QRect geom = geometry();
+    static auto oldMouseButtonState = Qt::NoButton;
 
     if (m_data.flags.testFlags(Qt::ExpandedClientAreaHint)) {
         bool isDefaultTitleBar = !w->flags().testFlag(Qt::CustomizeWindowHint);
@@ -3308,17 +3340,18 @@ bool QWindowsWindow::handleNonClientHitTest(const QPoint &globalPos, LRESULT *re
                                                                                                      Qt::WindowMaximizeButtonHint|
                                                                                                      Qt::WindowCloseButtonHint);
         const int border = (IsZoomed(m_data.hwnd) || isFullScreen_sys()) ? 0 : getResizeBorderThickness(savedDpi());
+        const int titleBarHeight = getTitleBarHeight_sys(savedDpi());
+        const int titleButtonWidth = titleBarHeight * 1.5;
+        const bool mouseButtonsSwapped = GetSystemMetrics(SM_SWAPBUTTON);
+        auto mouseButtons = Qt::NoButton;
+        if (mouseButtonsSwapped)
+            mouseButtons = GetAsyncKeyState(VK_LBUTTON) != 0 ? Qt::RightButton : (GetAsyncKeyState(VK_RBUTTON) ? Qt::LeftButton : Qt::NoButton);
+        else
+            mouseButtons = GetAsyncKeyState(VK_LBUTTON) != 0 ? Qt::LeftButton : (GetAsyncKeyState(VK_RBUTTON) ? Qt::RightButton : Qt::NoButton);
+
+        *result = HTCLIENT;
         if (isCustomized || isDefaultTitleBar) {
-            *result = HTCLIENT;
-            const int titleBarHeight = getTitleBarHeight_sys(savedDpi());
-            const int titleButtonWidth = titleBarHeight * 1.5;
             int buttons = 1;
-            const bool mouseButtonsSwapped = GetSystemMetrics(SM_SWAPBUTTON);
-            auto mouseButtons = Qt::NoButton;
-            if (mouseButtonsSwapped)
-                mouseButtons = GetAsyncKeyState(VK_LBUTTON) != 0 ? Qt::RightButton : (GetAsyncKeyState(VK_RBUTTON) ? Qt::LeftButton : Qt::NoButton);
-            else
-                mouseButtons = GetAsyncKeyState(VK_LBUTTON) != 0 ? Qt::LeftButton : (GetAsyncKeyState(VK_RBUTTON) ? Qt::RightButton : Qt::NoButton);
 
             if (globalPos.y() < geom.top() + titleBarHeight) {
                 if (m_data.flags.testFlags(Qt::WindowCloseButtonHint) || isDefaultTitleBar) {
@@ -3346,17 +3379,32 @@ bool QWindowsWindow::handleNonClientHitTest(const QPoint &globalPos, LRESULT *re
                 } if ((isCustomized || isDefaultTitleBar) &&
                       *result == HTCLIENT){
                     QWindow* wnd = window();
-                    if (mouseButtons != Qt::NoButton) {
-                        QMouseEvent event(QEvent::MouseButtonPress, localPos, globalPos, mouseButtons, mouseButtons, Qt::NoModifier);
-                        QGuiApplication::sendEvent(wnd, &event);
-                        if (!event.isAccepted() && mouseButtons == Qt::RightButton)
+                    if (mouseButtons != oldMouseButtonState) {
+                        auto mouseEventType = mouseButtons == Qt::NoButton ? QEvent::MouseButtonRelease : QEvent::MouseButtonPress;
+                        auto mouseEventButtons = mouseEventType == QEvent::MouseButtonPress ? mouseButtons : oldMouseButtonState;
+                        bool accepted = QWindowSystemInterface::handleMouseEvent<QWindowSystemInterface::SynchronousDelivery>(wnd, QHighDpi::toNativeLocalPosition(localPos, w), globalPos, mouseEventButtons, mouseEventButtons, mouseEventType);
+                        if (!accepted && mouseButtons == Qt::RightButton)
                             *result = HTSYSMENU;
-                        else if (!event.isAccepted())
+                        else if (!accepted && globalPos.y() < geom.top() + titleBarHeight)
                             *result = HTCAPTION;
                     }
                 }
             }
+        } else if (w->flags().testFlag(Qt::CustomizeWindowHint)) {
+
+            QWindow* wnd = window();
+            if (mouseButtons != oldMouseButtonState) {
+                auto mouseEventType = mouseButtons == Qt::NoButton ? QEvent::MouseButtonRelease : QEvent::MouseButtonPress;
+                auto mouseEventButtons = mouseEventType == QEvent::MouseButtonPress ? mouseButtons : oldMouseButtonState;
+                bool accepted = QWindowSystemInterface::handleMouseEvent<QWindowSystemInterface::SynchronousDelivery>(wnd, QHighDpi::toNativeLocalPosition(localPos, w), globalPos, mouseEventButtons, mouseEventButtons, mouseEventType);
+                if (!accepted && mouseButtons == Qt::RightButton)
+                    *result = HTSYSMENU;
+                else if (!accepted && globalPos.y() < geom.top() + titleBarHeight)
+                    *result = HTCAPTION;
+            }
         }
+        oldMouseButtonState = mouseButtons;
+
         if (border != 0) {
             const bool left   = (globalPos.x() >= geom.left()) && (globalPos.x() < geom.left() + border);
             const bool right  = (globalPos.x() >  geom.right() - border) && (globalPos.x() <= geom.right());
@@ -3991,22 +4039,40 @@ QString QWindowsWindow::formatWindowTitle(const QString &title)
 
 void QWindowsWindow::requestUpdate()
 {
+    enum UpdateState {
+        Ready = 0,
+        Requested = 1,
+        Posted = 2
+    };
     QWindow *w = window();
     QDxgiVSyncService *vs = QDxgiVSyncService::instance();
     if (vs->supportsWindow(w)) {
         if (m_vsyncServiceCallbackId == 0) {
             m_vsyncServiceCallbackId = vs->registerCallback([this, w](const QDxgiVSyncService::CallbackWindowList &windowList, qint64) {
                 if (windowList.contains(w)) {
-                    if (m_vsyncUpdatePending.testAndSetAcquire(1, 0)) {
-                        QMetaObject::invokeMethod(w, [this, w] {
-                            if (w->handle() == this)
-                                deliverUpdateRequest();
+                    // Make sure we only post one event at a time. If the state
+                    // isn't Requested, it means there either isn't a pending
+                    // request or we are waiting for the event loop to process
+                    // the Posted event on the GUI thread.
+                    if (m_vsyncUpdatePending.testAndSetAcquire(UpdateState::Requested, UpdateState::Posted)) {
+                        QWindowsWindow *oldSelf = this;
+                        qsizetype oldCallbackId = m_vsyncServiceCallbackId;
+                        QMetaObject::invokeMethod(w, [w, oldSelf, oldCallbackId] {
+                            // 'oldSelf' is only used for comparison, don't access it directly!
+                            auto *self = static_cast<QWindowsWindow *>(w->handle());
+                            // NOTE: In the off chance that the window got destroyed and recreated with the
+                            //       same address, we also check that the callback id is the same.
+                            if (self && self == oldSelf && self->m_vsyncServiceCallbackId == oldCallbackId) {
+                                // The platform window is still alive
+                                self->m_vsyncUpdatePending.storeRelease(UpdateState::Ready);
+                                self->deliverUpdateRequest();
+                            }
                         });
                     }
                 }
             });
         }
-        m_vsyncUpdatePending.storeRelease(1);
+        m_vsyncUpdatePending.testAndSetRelease(UpdateState::Ready, UpdateState::Requested);
     } else {
         QPlatformWindow::requestUpdate();
     }

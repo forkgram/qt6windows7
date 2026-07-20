@@ -10,7 +10,6 @@
 #include <private/qeventdispatcher_win_p.h>
 #include "qloggingcategory.h"
 #include "qmutex.h"
-#include "qthreadstorage.h"
 
 #include <qt_windows.h>
 
@@ -50,6 +49,7 @@ Q_STATIC_LOGGING_CATEGORY(lcQThread, "qt.core.thread", QtWarningMsg)
 
 Q_CONSTINIT static thread_local QThreadData *currentThreadData = nullptr;
 
+static void deref_current_thread_data(QThreadData *data);
 static void destroy_current_thread_data(void *p)
 {
     QThreadData *data = static_cast<QThreadData *>(p);
@@ -66,6 +66,12 @@ static void destroy_current_thread_data(void *p)
         // have begun destruction; we must not dereference the QThread pointer.
     }
 
+    deref_current_thread_data(data);
+}
+
+// static
+void deref_current_thread_data(QThreadData *data)
+{
     // the QThread object may still have a reference, so this may not delete
     data->deref();
 
@@ -107,19 +113,20 @@ QThreadData *QThreadData::currentThreadData() noexcept
 QThreadData *QThreadData::createCurrentThreadData()
 {
     Q_ASSERT(!currentThreadData());
-    std::unique_ptr data = std::make_unique<QThreadData>();
+
+    QThreadData *data = new QThreadData();
 
     // This needs to be called prior to new QAdoptedThread() to avoid
     // recursion (see qobject.cpp).
-    set_thread_data(data.get());
+    set_thread_data(data);
 
     QT_TRY {
-        data->thread.storeRelease(new QAdoptedThread(data.get()));
+        data->thread.storeRelease(new QAdoptedThread(data));
     } QT_CATCH(...) {
-        clearCurrentThreadData();
+        deref_current_thread_data(data);
         QT_RETHROW;
     }
-    return data.release();
+    return data;
 }
 
 void QAdoptedThread::init()
@@ -201,12 +208,13 @@ unsigned int __stdcall QT_ENSURE_STACK_ALIGNED_FOR_SSE QThreadPrivate::start(voi
 {
     QThread *thr = reinterpret_cast<QThread *>(arg);
     QThreadData *data = QThreadData::get2(thr);
-    // If a QThread is restarted, reuse the QBindingStatus, too
-    data->reuseBindingStatusForNewNativeThread();
 
     data->ref();
     set_thread_data(data);
     data->threadId.storeRelaxed(QThread::currentThreadId());
+
+    // If a QThread is restarted, reuse the QBindingStatus, too
+    data->reuseBindingStatusForNewNativeThread();
 
     QThread::setTerminationEnabled(false);
 

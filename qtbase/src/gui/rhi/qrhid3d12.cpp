@@ -889,6 +889,10 @@ bool QRhiD3D12::isFeatureSupported(QRhi::Feature feature) const
     case QRhi::PerRenderTargetBlending:
     case QRhi::SampleVariables:
         return true;
+    case QRhi::InstanceIndexIncludesBaseInstance:
+        return false;
+    case QRhi::DepthClamp:
+        return true;
     }
     return false;
 }
@@ -1060,6 +1064,9 @@ void QRhiD3D12::setGraphicsPipeline(QRhiCommandBuffer *cb, QRhiGraphicsPipeline 
 
         if (psD->viewInstanceMask)
             cbD->cmdList->SetViewInstanceMask(psD->viewInstanceMask);
+
+        if (cbD->hasCustomScissorSet && !psD->m_flags.testFlag(QRhiGraphicsPipeline::UsesScissor))
+            setDefaultScissor(cbD);
     }
 }
 
@@ -1167,6 +1174,15 @@ void QRhiD3D12::setShaderResources(QRhiCommandBuffer *cb, QRhiShaderResourceBind
 
     QD3D12ShaderResourceBindings *srbD = QRHI_RES(QD3D12ShaderResourceBindings, srb);
 
+    bool pipelineChanged = false;
+    if (gfxPsD) {
+        pipelineChanged = srbD->lastUsedGraphicsPipeline != gfxPsD;
+        srbD->lastUsedGraphicsPipeline = gfxPsD;
+    } else {
+        pipelineChanged = srbD->lastUsedComputePipeline != compPsD;
+        srbD->lastUsedComputePipeline = compPsD;
+    }
+
     for (int i = 0, ie = srbD->m_bindings.size(); i != ie; ++i) {
         const QRhiShaderResourceBinding::Data *b = shaderResourceBindingData(srbD->m_bindings[i]);
         switch (b->type) {
@@ -1175,6 +1191,7 @@ void QRhiD3D12::setShaderResources(QRhiCommandBuffer *cb, QRhiShaderResourceBind
             QD3D12Buffer *bufD = QRHI_RES(QD3D12Buffer, b->u.ubuf.buf);
             Q_ASSERT(bufD->m_usage.testFlag(QRhiBuffer::UniformBuffer));
             Q_ASSERT(bufD->m_type == QRhiBuffer::Dynamic);
+            sanityCheckResourceOwnership(bufD);
             bufD->executeHostWritesForFrameSlot(currentFrameSlot);
         }
             break;
@@ -1190,6 +1207,8 @@ void QRhiD3D12::setShaderResources(QRhiCommandBuffer *cb, QRhiShaderResourceBind
                 // images and samplers, so tex or sampler (but not both) can be
                 // null here.
                 Q_ASSERT(texD || samplerD);
+                sanityCheckResourceOwnership(texD);
+                sanityCheckResourceOwnership(samplerD);
                 if (texD) {
                     UINT state = 0;
                     if (b->stage == QRhiShaderResourceBinding::FragmentStage) {
@@ -1210,6 +1229,7 @@ void QRhiD3D12::setShaderResources(QRhiCommandBuffer *cb, QRhiShaderResourceBind
         case QRhiShaderResourceBinding::ImageLoadStore:
         {
             QD3D12Texture *texD = QRHI_RES(QD3D12Texture, b->u.simage.tex);
+            sanityCheckResourceOwnership(texD);
             if (QD3D12Resource *res = resourcePool.lookupRef(texD->handle)) {
                 if (res->uavUsage) {
                     if (res->uavUsage & QD3D12Resource::UavUsageWrite) {
@@ -1239,6 +1259,7 @@ void QRhiD3D12::setShaderResources(QRhiCommandBuffer *cb, QRhiShaderResourceBind
         case QRhiShaderResourceBinding::BufferLoadStore:
         {
             QD3D12Buffer *bufD = QRHI_RES(QD3D12Buffer, b->u.sbuf.buf);
+            sanityCheckResourceOwnership(bufD);
             Q_ASSERT(bufD->m_usage.testFlag(QRhiBuffer::StorageBuffer));
             Q_ASSERT(bufD->m_type != QRhiBuffer::Dynamic);
             if (QD3D12Resource *res = resourcePool.lookupRef(bufD->handles[0])) {
@@ -1271,7 +1292,7 @@ void QRhiD3D12::setShaderResources(QRhiCommandBuffer *cb, QRhiShaderResourceBind
     const bool srbChanged = gfxPsD ? (cbD->currentGraphicsSrb != srb) : (cbD->currentComputeSrb != srb);
     const bool srbRebuilt = cbD->currentSrbGeneration != srbD->generation;
 
-    if (srbChanged || srbRebuilt || srbD->hasDynamicOffset) {
+    if (pipelineChanged || srbChanged || srbRebuilt || srbD->hasDynamicOffset) {
         const QD3D12ShaderStageData *stageData = gfxPsD ? gfxPsD->stageData.data() : &compPsD->stageData;
 
         // The order of root parameters must match
@@ -1488,6 +1509,33 @@ void QRhiD3D12::setVertexInput(QRhiCommandBuffer *cb,
     }
 }
 
+void QRhiD3D12::setDefaultScissor(QD3D12CommandBuffer *cbD)
+{
+    cbD->hasCustomScissorSet = false;
+
+    const QSize outputSize = cbD->currentTarget->pixelSize();
+    std::array<float, 4> vp = cbD->currentViewport.viewport();
+    float x = 0, y = 0, w = 0, h = 0;
+
+    if (qFuzzyIsNull(vp[2]) && qFuzzyIsNull(vp[3])) {
+        x = 0;
+        y = 0;
+        w = outputSize.width();
+        h = outputSize.height();
+    } else {
+        // x,y is top-left in D3D12_RECT but bottom-left in QRhiScissor
+        qrhi_toTopLeftRenderTargetRect<Bounded>(outputSize, vp, &x, &y, &w, &h);
+    }
+
+    D3D12_RECT r;
+    r.left = x;
+    r.top = y;
+    // right and bottom are exclusive
+    r.right = x + w;
+    r.bottom = y + h;
+    cbD->cmdList->RSSetScissorRects(1, &r);
+}
+
 void QRhiD3D12::setViewport(QRhiCommandBuffer *cb, const QRhiViewport &viewport)
 {
     QD3D12CommandBuffer *cbD = QRHI_RES(QD3D12CommandBuffer, cb);
@@ -1509,17 +1557,11 @@ void QRhiD3D12::setViewport(QRhiCommandBuffer *cb, const QRhiViewport &viewport)
     v.MaxDepth = viewport.maxDepth();
     cbD->cmdList->RSSetViewports(1, &v);
 
+    cbD->currentViewport = viewport;
     if (cbD->currentGraphicsPipeline
-            && !cbD->currentGraphicsPipeline->flags().testFlag(QRhiGraphicsPipeline::UsesScissor))
+        && !cbD->currentGraphicsPipeline->flags().testFlag(QRhiGraphicsPipeline::UsesScissor))
     {
-        qrhi_toTopLeftRenderTargetRect<Bounded>(outputSize, viewport.viewport(), &x, &y, &w, &h);
-        D3D12_RECT r;
-        r.left = x;
-        r.top = y;
-        // right and bottom are exclusive
-        r.right = x + w;
-        r.bottom = y + h;
-        cbD->cmdList->RSSetScissorRects(1, &r);
+        setDefaultScissor(cbD);
     }
 }
 
@@ -1542,6 +1584,8 @@ void QRhiD3D12::setScissor(QRhiCommandBuffer *cb, const QRhiScissor &scissor)
     r.right = x + w;
     r.bottom = y + h;
     cbD->cmdList->RSSetScissorRects(1, &r);
+
+    cbD->hasCustomScissorSet = true;
 }
 
 void QRhiD3D12::setBlendConstants(QRhiCommandBuffer *cb, const QColor &c)
@@ -3816,6 +3860,7 @@ void QRhiD3D12::enqueueResourceUpdates(QD3D12CommandBuffer *cbD, QRhiResourceUpd
                             QSize size = subresDesc.sourceSize().isEmpty() ? img.size() : subresDesc.sourceSize();
                             size.setWidth(qMin(size.width(), img.width() - srcPos.x()));
                             size.setHeight(qMin(size.height(), img.height() - srcPos.y()));
+                            size = clampedSubResourceUploadSize(size, dstPos, level, texD->m_pixelSize);
 
                             footprint.Width = size.width();
                             footprint.Height = size.height();
@@ -6188,6 +6233,7 @@ bool QD3D12GraphicsPipeline::create()
     struct {
         QD3D12PipelineStateSubObject<ID3D12RootSignature *, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE> rootSig;
         QD3D12PipelineStateSubObject<D3D12_INPUT_LAYOUT_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT> inputLayout;
+        QD3D12PipelineStateSubObject<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE> primitiveRestartValue;
         QD3D12PipelineStateSubObject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY> primitiveTopology;
         QD3D12PipelineStateSubObject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS> VS;
         QD3D12PipelineStateSubObject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS> HS;
@@ -6246,6 +6292,8 @@ bool QD3D12GraphicsPipeline::create()
     stream.inputLayout.object.NumElements = inputDescs.count();
     stream.inputLayout.object.pInputElementDescs = inputDescs.isEmpty() ? nullptr : inputDescs.constData();
 
+    stream.primitiveRestartValue.object = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+
     stream.primitiveTopology.object = toD3DTopologyType(m_topology);
     topology = toD3DTopology(m_topology, m_patchControlPointCount);
 
@@ -6283,7 +6331,7 @@ bool QD3D12GraphicsPipeline::create()
     stream.rasterizerState.object.FrontCounterClockwise = m_frontFace == CCW;
     stream.rasterizerState.object.DepthBias = m_depthBias;
     stream.rasterizerState.object.SlopeScaledDepthBias = m_slopeScaledDepthBias;
-    stream.rasterizerState.object.DepthClipEnable = TRUE;
+    stream.rasterizerState.object.DepthClipEnable = m_depthClamp ? FALSE : TRUE;
     stream.rasterizerState.object.MultisampleEnable = sampleDesc.Count > 1;
 
     stream.depthStencilState.object.DepthEnable = m_depthTest;
@@ -6955,7 +7003,11 @@ bool QD3D12SwapChain::createOrResize()
                 rhiD->dxgiFactory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_WINDOW_CHANGES);
             }
         }
-        if (FAILED(hr)) {
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            qWarning("Device loss detected during swapchain creation");
+            rhiD->deviceLost = true;
+            return false;
+        } else if (FAILED(hr)) {
             qWarning("Failed to create D3D12 swapchain: %s"
                      " (Width=%u Height=%u Format=%u SampleCount=%u BufferCount=%u Scaling=%u SwapEffect=%u Stereo=%u)",
                      qPrintable(QSystemError::windowsComString(hr)),

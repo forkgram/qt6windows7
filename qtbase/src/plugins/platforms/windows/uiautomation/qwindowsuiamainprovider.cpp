@@ -1,5 +1,6 @@
 // Copyright (C) 2017 The Qt Company Ltd.
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+// Qt-Security score:significant reason:default
 
 #include <QtGui/qtguiglobal.h>
 #if QT_CONFIG(accessibility)
@@ -28,7 +29,6 @@
 #include <QtGui/qaccessible.h>
 #include <QtGui/qguiapplication.h>
 #include <QtGui/qwindow.h>
-#include <qpa/qplatforminputcontextfactory_p.h>
 #include <QtCore/private/qcomvariant_p.h>
 
 #if !defined(Q_CC_BOR) && !defined (Q_CC_GNU)
@@ -84,8 +84,12 @@ void QWindowsUiaMainProvider::notifyStateChange(QAccessibleStateChangeEvent *eve
 {
     if (QAccessibleInterface *accessible = event->accessibleInterface()) {
         if (event->changedStates().checked || event->changedStates().checkStateMixed) {
-           // Notifies states changes in checkboxes.
-           if (accessible->role() == QAccessible::CheckBox) {
+            // Notifies states changes in checkboxes, switches, and checkable item view items.
+            if (accessible->role() == QAccessible::CheckBox
+                || accessible->role() == QAccessible::Switch
+                || accessible->role() == QAccessible::Cell
+                || accessible->role() == QAccessible::ListItem
+                || accessible->role() == QAccessible::TreeItem) {
                 if (auto provider = providerForAccessible(accessible)) {
                     long toggleState = ToggleState_Off;
                     if (accessible->state().checked)
@@ -170,6 +174,18 @@ void QWindowsUiaMainProvider::notifyNameChange(QAccessibleEvent *event)
                 QWindowsUiaWrapper::instance()->raiseAutomationPropertyChangedEvent(provider.Get(), UIA_NamePropertyId,
                                                        oldVal.get(), newVal.get());
             }
+        }
+    }
+}
+
+void QWindowsUiaMainProvider::notifyRoleChange(QAccessibleEvent *event)
+{
+    if (QAccessibleInterface *accessible = event->accessibleInterface()) {
+        if (auto provider = providerForAccessible(accessible)) {
+            QComVariant oldVal;
+            QComVariant newVal{ roleToControlTypeId(accessible->role()) };
+            UiaRaiseAutomationPropertyChangedEvent(provider.Get(), UIA_ControlTypePropertyId,
+                                                   oldVal.get(), newVal.get());
         }
     }
 }
@@ -575,31 +591,24 @@ HRESULT QWindowsUiaMainProvider::GetPropertyValue(PROPERTYID idProp, VARIANT *pR
             *pRetVal = QComVariant{ UIA_WindowControlTypeId }.release();
         } else {
             // Control type converted from role.
-            auto controlType = roleToControlTypeId(accessible->role());
-
-            // The native OSK should be disabled if the Qt OSK is in use,
-            // or if disabled via application attribute.
-            static bool imModuleEmpty = QPlatformInputContextFactory::requested().isEmpty();
-            bool nativeVKDisabled = QCoreApplication::testAttribute(Qt::AA_DisableNativeVirtualKeyboard);
-
-            // If we want to disable the native OSK auto-showing
-            // we have to report text fields as non-editable.
-            if (controlType == UIA_EditControlTypeId && (!imModuleEmpty || nativeVKDisabled))
-                controlType = UIA_TextControlTypeId;
-
-            *pRetVal = QComVariant{ controlType }.release();
+            *pRetVal = QComVariant{ roleToControlTypeId(accessible->role()) }.release();
         }
         break;
     case UIA_HelpTextPropertyId:
         *pRetVal = QComVariant{ accessible->text(QAccessible::Help) }.release();
         break;
     case UIA_HasKeyboardFocusPropertyId:
+        // If the top-level window has no focused child, report the top-level
+        // widget (window). If it already has a focused widget, it will be
+        // reported automatically.
         if (topLevelWindow) {
-            // Windows set the active state to true when they are focused
-            *pRetVal = QComVariant{ accessible->state().active ? true : false }.release();
-        } else {
-            *pRetVal = QComVariant{ accessible->state().focused ? true : false }.release();
+            QAccessibleInterface *focusacc = accessible->focusChild();
+            if (!focusacc) {
+                *pRetVal = QComVariant{ accessible->state().active ? true : false }.release();
+                break;
+            }
         }
+        *pRetVal = QComVariant{ accessible->state().focused ? true : false }.release();
         break;
     case UIA_IsKeyboardFocusablePropertyId:
         if (topLevelWindow) {
@@ -653,6 +662,21 @@ HRESULT QWindowsUiaMainProvider::GetPropertyValue(PROPERTYID idProp, VARIANT *pR
         if (name.isEmpty() && topLevelWindow)
            name = QCoreApplication::applicationName();
         *pRetVal = QComVariant{ name }.release();
+        break;
+    }
+    case UIA_OrientationPropertyId: {
+        OrientationType orientationType = OrientationType_None;
+        if (QAccessibleAttributesInterface *attributesIface = accessible->attributesInterface()) {
+            const QVariant orientationVariant =
+                    attributesIface->attributeValue(QAccessible::Attribute::Orientation);
+            if (orientationVariant.isValid()) {
+                Q_ASSERT(orientationVariant.canConvert<Qt::Orientation>());
+                const Qt::Orientation orientation = orientationVariant.value<Qt::Orientation>();
+                orientationType = orientation == Qt::Horizontal ? OrientationType_Horizontal
+                                                                : OrientationType_Vertical;
+            }
+        }
+        *pRetVal = QComVariant{ long(orientationType) }.release();
         break;
     }
     case UIA_StyleIdAttributeId:

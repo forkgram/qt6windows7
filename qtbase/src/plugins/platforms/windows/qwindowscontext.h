@@ -1,5 +1,6 @@
 // Copyright (C) 2016 The Qt Company Ltd.
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+// Qt-Security score:significant reason:default
 
 #ifndef QWINDOWSCONTEXT_H
 #define QWINDOWSCONTEXT_H
@@ -163,11 +164,6 @@ public:
 
     int defaultDPI() const;
 
-    static QString classNamePrefix();
-    QString registerWindowClass(const QWindow *w);
-    QString registerWindowClass(QString cname, WNDPROC proc,
-                                unsigned style = 0, HBRUSH brush = nullptr,
-                                bool icon = false);
     HWND createDummyWindow(const QString &classNameIn,
                            const wchar_t *windowName,
                            WNDPROC wndProc = nullptr, DWORD style = WS_OVERLAPPED);
@@ -255,7 +251,6 @@ private:
     bool handleContextMenuEvent(QWindow *window, const MSG &msg);
 #endif
     void handleExitSizeMove(QWindow *window);
-    void unregisterWindowClasses();
 
     QScopedPointer<QWindowsContextPrivate> d;
     static QWindowsContext *m_instance;

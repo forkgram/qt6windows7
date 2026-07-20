@@ -1,6 +1,7 @@
 // Copyright (C) 2016 The Qt Company Ltd.
 // Copyright (C) 2016 Intel Corporation.
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+// Qt-Security score:significant reason:default
 
 #include "qeventdispatcher_win_p.h"
 
@@ -349,10 +350,10 @@ void QEventDispatcherWin32Private::registerTimer(WinTimerInfo *t)
 
     bool ok = false;
     ULONG tolerance = calculateNextTimeout(t, qt_msectime());
-    uint interval = q26::saturate_cast<uint>(t->interval);
+    uint interval = q26::saturating_cast<uint>(t->interval);
     if (interval != t->interval) {
         // Now we'll need to post the timer event at each second timeout.
-        interval = q26::saturate_cast<uint>(t->interval / 2 + 1);
+        interval = q26::saturating_cast<uint>(t->interval / 2 + 1);
         t->usesExtendedInterval = true;
         t->isSecondTimeout = false;
     }
@@ -368,13 +369,14 @@ void QEventDispatcherWin32Private::registerTimer(WinTimerInfo *t)
         ok = t->fastTimerId;
     }
 
-    typedef BOOL (WINAPI *SetCoalescableTimerFunc) (HWND, UINT_PTR, UINT, TIMERPROC, ULONG);
-    static SetCoalescableTimerFunc mySetCoalescableTimerFunc = 
-        (SetCoalescableTimerFunc)::GetProcAddress(::GetModuleHandle(L"User32"), "SetCoalescableTimer");
-
-    if (!ok && mySetCoalescableTimerFunc) {
+    if (!ok) {
         // user normal timers for (Very)CoarseTimers, or if no more multimedia timers available
-        ok = mySetCoalescableTimerFunc(internalHwnd, t->timerId, interval, nullptr, tolerance);
+        // SetCoalescableTimer needs Windows 8, resolve it dynamically and skip on Windows 7.
+        typedef BOOL (WINAPI *SetCoalescableTimerFunc)(HWND, UINT_PTR, UINT, TIMERPROC, ULONG);
+        static const SetCoalescableTimerFunc mySetCoalescableTimerFunc = (SetCoalescableTimerFunc)
+            ::GetProcAddress(::GetModuleHandle(L"User32"), "SetCoalescableTimer");
+        if (mySetCoalescableTimerFunc)
+            ok = mySetCoalescableTimerFunc(internalHwnd, t->timerId, interval, nullptr, tolerance);
     }
 
     if (!ok)

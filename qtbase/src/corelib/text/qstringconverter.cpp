@@ -32,9 +32,8 @@
 #include <QtCore/private/wcharhelpers_win_p.h>
 
 #include <QtCore/q20iterator.h>
-#include <QtCore/q26numeric.h>
 #endif // !QT_BOOTSTRAPPED
-#endif
+#endif // Q_OS_WIN
 
 #include <array>
 #if __has_include(<bit>) && __cplusplus > 201703L
@@ -42,6 +41,9 @@
 #endif
 #include <string>
 #include <QtCore/q20utility.h>
+#ifndef QT_BOOTSTRAPPED
+#include <QtCore/q26numeric.h>
+#endif // !QT_BOOTSTRAPPED
 
 QT_BEGIN_NAMESPACE
 
@@ -1376,6 +1378,18 @@ QChar *QUtf32::convertToUnicode(QChar *out, QByteArrayView in, QStringConverter:
     qsizetype num = state->remainingChars;
     state->remainingChars = 0;
 
+    const auto writeCodeToOutput = [&](char32_t code) {
+        if (Q_UNLIKELY(code > QChar::LastValidCodePoint)) {
+            if (state->flags & QStringDecoder::Flag::ConvertInvalidToNull)
+                *out++ = QChar::Null;
+            else
+                *out++ = QChar::ReplacementCharacter;
+        } else {
+            for (char16_t c : QChar::fromUcs4(code))
+                *out++ = c;
+        }
+    };
+
     if (!headerdone || endian == DetectEndianness || num) {
         while (num < 4)
             tuple[num++] = *chars++;
@@ -1393,12 +1407,7 @@ QChar *QUtf32::convertToUnicode(QChar *out, QByteArrayView in, QStringConverter:
         }
         char32_t code = (endian == BigEndianness) ? qFromBigEndian<char32_t>(tuple) : qFromLittleEndian<char32_t>(tuple);
         if (headerdone || code != QChar::ByteOrderMark) {
-            if (QChar::requiresSurrogates(code)) {
-                *out++ = QChar(QChar::highSurrogate(code));
-                *out++ = QChar(QChar::lowSurrogate(code));
-            } else {
-                *out++ = QChar(code);
-            }
+            writeCodeToOutput(code);
         }
         num = 0;
     } else if (endian == DetectEndianness) {
@@ -1411,8 +1420,7 @@ QChar *QUtf32::convertToUnicode(QChar *out, QByteArrayView in, QStringConverter:
         tuple[num++] = *chars++;
         if (num == 4) {
             char32_t code = (endian == BigEndianness) ? qFromBigEndian<char32_t>(tuple) : qFromLittleEndian<char32_t>(tuple);
-            for (char16_t c : QChar::fromUcs4(code))
-                *out++ = c;
+            writeCodeToOutput(code);
             num = 0;
         }
     }
@@ -1547,12 +1555,12 @@ QString QLocal8Bit::convertToUnicode_sys(QByteArrayView in, quint32 codePage,
 
     // Need it in this scope, since we try to decrease our window size if we
     // encounter an error
-    int nextIn = q26::saturate_cast<int>(mblen);
+    int nextIn = q26::saturating_cast<int>(mblen);
     while (mblen > 0) {
         std::tie(out, outlen) = growOut(1); // Need space for at least one character
         if (!out)
             return {};
-        const int nextOut = q26::saturate_cast<int>(outlen);
+        const int nextOut = q26::saturating_cast<int>(outlen);
         int len = MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, mb, nextIn, out, nextOut);
         if (len) {
             mb += nextIn;
@@ -1612,7 +1620,7 @@ QString QLocal8Bit::convertToUnicode_sys(QByteArrayView in, quint32 codePage,
                 break;
             }
         }
-        nextIn = q26::saturate_cast<int>(mblen);
+        nextIn = q26::saturating_cast<int>(mblen);
     }
 
     if (sp.isEmpty()) {
@@ -1734,7 +1742,7 @@ QByteArray QLocal8Bit::convertFromUnicode_sys(QStringView in, quint32 codePage,
     };
 
     const auto getNextWindowSize = [&]() {
-        int nextIn = q26::saturate_cast<int>(uclen);
+        int nextIn = q26::saturating_cast<int>(uclen);
         // The Windows API has some issues if the current window ends in the
         // middle of a surrogate pair, so we avoid that:
         if (nextIn > 1 && QChar::isHighSurrogate(ch[nextIn - 1]))
@@ -1748,7 +1756,7 @@ QByteArray QLocal8Bit::convertFromUnicode_sys(QStringView in, quint32 codePage,
         std::tie(out, outlen) = growOut(1); // We need at least one byte
         if (!out)
             return {};
-        const int nextOut = q26::saturate_cast<int>(outlen);
+        const int nextOut = q26::saturating_cast<int>(outlen);
         len = WideCharToMultiByte(codePage, 0, ch, nextIn, out, nextOut, nullptr, nullptr);
         if (len > 0) {
             ch += nextIn;
@@ -2483,6 +2491,27 @@ std::optional<QStringConverter::Encoding> QStringConverter::encodingForName(QAny
 }
 
 #ifndef QT_BOOTSTRAPPED
+namespace QtPrivate {
+// Note: Check isValid() on the QStringConverter before calling this with its
+// state!
+static int partiallyParsedDataCount(QStringConverter::State *state)
+{
+#if QT_CONFIG(icu)
+    if (state->flags & QStringConverter::Flag::UsesIcu) {
+        UConverter *converter = static_cast<UConverter *>(state->d[0]);
+        if (!converter)
+            return 0;
+        UErrorCode err = U_ZERO_ERROR;
+        auto leftOver = ucnv_fromUCountPending(converter, &err);
+        // If there is an error, leftOver is -1, so no need for an additional
+        // check.
+        return std::max(leftOver, 0);
+    }
+#endif
+    return q26::saturating_cast<int>(state->remainingChars);
+}
+} // namespace QtPrivate
+
 /*!
    Returns the encoding for the content of \a data if it can be determined.
    \a expectedFirstCharacter can be passed as an additional hint to help determine
@@ -2651,6 +2680,201 @@ QStringList QStringConverter::availableCodecs()
 }
 
 /*!
+    \class QStringConverter::FinalizeResultChar
+    \inmodule QtCore
+    \since 6.11
+    \reentrant
+    \brief Holds the result of calling finalize() on QStringDecoder or
+    QStringEncoder.
+
+    This class is used to relay the result of the finalize() call or the reason
+    why the call did not succeed.
+*/
+/*!
+    \enum QStringConverter::FinalizeResultError
+    \value NoError No error.
+    \value InvalidCharacters The encoder successfully finalized, but encountered
+                             invalid characters either during finalization or some time earlier.
+    \value NotEnoughSpace finalize() did \e{not} succeed, you must grow the
+                          buffer and call finalize() again.
+*/
+
+/*!
+    \variable QStringConverter::FinalizeResultChar::error
+    Relays errors discovered during finalization.
+*/
+/*!
+    \variable QStringConverter::FinalizeResultChar::next
+    Points to the character position \e{following} the last-written character.
+*/
+/*!
+    \variable QStringConverter::FinalizeResultChar::invalidChars
+    The number of invalid characters that were previously counted in the state
+    as well as any that were encountered during the call to finalize().
+*/
+
+/*!
+    \typedef QStringDecoder::FinalizeResult
+
+    This is an alias for QStringConverter::FinalizeResultChar<char16_t>.
+*/
+
+/*!
+    \typedef QStringDecoder::FinalizeResultQChar
+
+    This is an alias for QStringConverter::FinalizeResultChar<QChar>.
+*/
+
+/*!
+    \fn QStringDecoder::FinalizeResultQChar QStringDecoder::finalize(QChar *out, qsizetype maxlen)
+    \fn QStringDecoder::FinalizeResult QStringDecoder::finalize(char16_t *out, qsizetype maxlen)
+    \fn QStringDecoder::FinalizeResult QStringDecoder::finalize()
+
+    Signals to the decoder that no further data will arrive.
+
+    May also provide data from residual content that was pending decoding.
+    When there is no residual data to account for, the return's \c error
+    field will be set to \l {QStringConverter::FinalizeResultChar::error}
+    {NoError}.
+
+    If \a out is supplied and non-null, it must have space in which up to
+    \a maxlen characters may be written. Up to this many characters of
+    residual output are written to this space, with the end indicated by
+    the return-value's \c next field. Typically this residual data shall
+    consist of one replacement character per remaining unconverted input
+    character.
+
+    If all residual content has been delivered via \a out, if \a out is
+    \nullptr, or if there is no residual data, the decoder is reset on
+    return from finalize(). Otherwise, the remaining data can be retrieved
+    or discarded by a further call to finalize().
+
+    \since 6.11
+    \sa hasError(), appendToBuffer()
+ */
+auto QStringDecoder::finalize(char16_t *out, qsizetype maxlen) -> FinalizeResult
+{
+    int count = 0;
+    if (isValid())
+        count = QtPrivate::partiallyParsedDataCount(&state);
+    using Error = FinalizeResult::Error;
+    const qint16 invalidChars = q26::saturating_cast<qint16>(state.invalidChars + count);
+    if (count == 0 || !out) {
+        resetState();
+        return {out, invalidChars, invalidChars ? Error::InvalidCharacters : Error::NoError};
+    }
+    if (maxlen < count)
+        return {out, invalidChars, Error::NotEnoughSpace};
+
+    const char16_t replacement = (state.flags & QStringConverter::Flag::ConvertInvalidToNull)
+            ? QChar::Null
+            : QChar::ReplacementCharacter;
+    out = std::fill_n(out, count, replacement);
+    resetState();
+    return {out, invalidChars, invalidChars ? Error::InvalidCharacters : Error::NoError};
+}
+
+/*!
+    \typedef QStringEncoder::FinalizeResult
+
+    This is an alias for QStringConverter::FinalizeResultChar<char>.
+*/
+
+/*!
+    \fn QStringEncoder::FinalizeResult QStringEncoder::finalize(char *out, qsizetype maxlen)
+    \fn QStringEncoder::FinalizeResult QStringEncoder::finalize()
+
+    Signals to the decoder that no further data will arrive.
+
+    May also provide data from residual content that was pending decoding.
+    When there is no residual data to account for, the return's \c error
+    field will be set to \l {QStringConverter::FinalizeResultChar::error}
+    {NoError}.
+
+    If \a out is supplied and non-null, it must have space in which up to
+    \a maxlen characters may be written. Up to this many characters of
+    residual output are written to this space, with the end indicated by
+    the return-value's \c next field. Typically this residual data shall
+    consist of one replacement character per remaining unconverted input
+    character. When using a stateful encoding, such as ISO-2022-JP, this may
+    also write bytes to restore, or end, the current state in the character
+    stream.
+
+    If all residual content has been delivered via \a out, if \a out is
+    \nullptr, or if there is no residual data, the decoder is reset on
+    return from finalize(). Otherwise, the remaining data can be retrieved
+    or discarded by a further call to finalize().
+
+    \since 6.11
+    \sa hasError(), appendToBuffer()
+ */
+auto QStringEncoder::finalize(char *out, qsizetype maxlen) -> QStringEncoder::FinalizeResult
+{
+    qsizetype count = 0;
+    if (isValid())
+        count = QtPrivate::partiallyParsedDataCount(&state);
+    // For ICU we may be using a stateful codec that need to restore or finalize
+    // some state, otherwise we have nothing to do with count == 0
+    using Error = FinalizeResult::Error;
+    const bool usesIcu = !!(state.flags & QStringConverter::Flag::UsesIcu) && !!state.d[0];
+    const qint16 invalidChars = q26::saturating_cast<qint16>(state.invalidChars + count);
+    if (!isValid() || (!count && !usesIcu) || !out) {
+        resetState();
+        return {out, invalidChars, invalidChars ? Error::InvalidCharacters : Error::NoError};
+    }
+
+    if ((false)) {
+#if defined(QT_USE_ICU_CODECS)
+    } else if (usesIcu) {
+        Q_ASSERT(out);
+        auto *icu_conv = static_cast<UConverter *>(state.d[0]);
+        Q_ASSERT(icu_conv); // bool usesIcu checks that the pointer is non-null
+        UErrorCode err = U_ZERO_ERROR;
+
+        UBool flush = true;
+
+        // If the QStringConverter was moved, the state that we used as a context is stale now.
+        UConverterFromUCallback action;
+        const void *context;
+        ucnv_getFromUCallBack(icu_conv, &action, &context);
+        if (context != &state)
+            ucnv_setFromUCallBack(icu_conv, action, &state, nullptr, nullptr, &err);
+        const UChar *dummyInput = u"";
+        const char *outEnd = out + maxlen;
+        ucnv_fromUnicode(icu_conv, &out, outEnd, &dummyInput, dummyInput, nullptr, flush, &err);
+        if (err == U_BUFFER_OVERFLOW_ERROR)
+            return {out, invalidChars, Error::NotEnoughSpace};
+        resetState();
+#endif
+    } else if (!(state.flags & QStringConverter::Flag::ConvertInvalidToNull)) {
+        /*
+            We don't really know (in general) how the replacement character
+            looks like in the target encoding. So we just encode 0xfffd, which
+            is the Unicode replacement character.
+            Use 4 as a best-guess for the upper-bound of how many characters
+            would potentially be produced by the leftover UTF-16 characters in
+            the state
+        */
+        constexpr QChar replacementCharacter = QChar::ReplacementCharacter;
+        constexpr char16_t repl = replacementCharacter.unicode();
+        constexpr std::array<char16_t, 4> replacement{ repl, repl, repl, repl };
+        const qsizetype charactersToEncode = std::min(count, qsizetype(replacement.size()));
+        if (maxlen < requiredSpace(charactersToEncode))
+            return {out, invalidChars, Error::NotEnoughSpace};
+        // we don't want the incomplete data in the internal buffer; we're
+        // flushing the buffer after all
+        resetState();
+        out = appendToBuffer(out, QStringView(replacement.data(), charactersToEncode));
+    } else /* outputting Null characters for each remaining unconverted input character */ {
+        if (maxlen < count)
+            return {out, invalidChars, Error::NotEnoughSpace};
+        out = std::fill_n(out, count, '\0');
+        resetState();
+    }
+    return {out, invalidChars, invalidChars ? Error::InvalidCharacters : Error::NoError};
+}
+
+/*!
     Tries to determine the encoding of the HTML in \a data by looking at leading byte
     order marks or a charset specifier in the HTML meta tag and returns a QStringDecoder
     matching the encoding. If the returned decoder is not valid,
@@ -2781,7 +3005,8 @@ const char *QStringConverter::nameForEncoding(QStringConverter::Encoding e) noex
 
     \note \a out must be large enough to be able to hold all the decoded data. Use
     requiredSpace() to determine the maximum size requirement to be able to encode
-    \a in.
+    \a in. This function may write to any bytes between \a out and \c{out +
+    requiredSpace()}, including those past the returned end pointer.
 
     \sa requiredSpace()
 */
@@ -2877,7 +3102,9 @@ const char *QStringConverter::nameForEncoding(QStringConverter::Encoding e) noex
 
     \a out needs to be large enough to be able to hold all the decoded data. Use
     \l{requiredSpace} to determine the maximum size requirements to decode an encoded
-    data buffer of \c in.size() bytes.
+    data buffer of \c in.size() bytes. This function may write to any bytes
+    between \a out and \c{out + requiredSpace()}, including those past the
+    returned end pointer.
 
     \sa requiredSpace
 */

@@ -1,5 +1,6 @@
 // Copyright (C) 2016 The Qt Company Ltd.
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+// Qt-Security score:significant reason:default
 
 #include "qwindowsstyle_p.h"
 #include "qwindowsstyle_p_p.h"
@@ -19,6 +20,7 @@
 #endif
 #include "qpaintengine.h"
 #include "qpainter.h"
+#include "qpainterstateguard.h"
 #if QT_CONFIG(rubberband)
 #include "qrubberband.h"
 #endif
@@ -118,8 +120,7 @@ bool QWindowsStyle::eventFilter(QObject *o, QEvent *e)
             // Alt has been pressed - find all widgets that care
             const QList<QWidget *> children = widget->findChildren<QWidget *>();
             auto ignorable = [](QWidget *w) {
-                return w->isWindow() || !w->isVisible()
-                        || w->style()->styleHint(SH_UnderlineShortcut, nullptr, w);
+                return w->isWindow() || !w->isVisible();
             };
             // Update states before repainting
             d->seenAlt.append(widget);
@@ -166,7 +167,7 @@ bool QWindowsStyle::eventFilter(QObject *o, QEvent *e)
 
     This style is Qt's default GUI style on Windows.
 
-    \image qwindowsstyle.png
+    \image qwindowsstyle.png {Gallery of widgets using the default GUI style}
     \sa QWindowsVistaStyle, QMacStyle, QFusionStyle
 */
 
@@ -483,7 +484,7 @@ int QWindowsStyle::styleHint(StyleHint hint, const QStyleOption *opt, const QWid
     case SH_MenuBar_AltKeyNavigation:
     case SH_MenuBar_MouseTracking:
     case SH_Menu_MouseTracking:
-    case SH_ComboBox_ListMouseTracking:
+    case SH_ComboBox_ListMouseTracking_Current:
     case SH_Slider_StopMouseOverSlider:
     case SH_MainWindow_SpaceBelowMenuBar:
         ret = 1;
@@ -594,48 +595,42 @@ void QWindowsStyle::drawPrimitive(PrimitiveElement pe, const QStyleOption *opt, 
 
     switch (pe) {
 #if QT_CONFIG(toolbar)
-  case PE_IndicatorToolBarSeparator:
-        {
-            QRect rect = opt->rect;
-            const int margin = 2;
-            QPen oldPen = p->pen();
-            if (opt->state & State_Horizontal){
-                const int offset = rect.width()/2;
-                p->setPen(opt->palette.dark().color());
-                p->drawLine(rect.bottomLeft().x() + offset,
-                            rect.bottomLeft().y() - margin,
-                            rect.topLeft().x() + offset,
-                            rect.topLeft().y() + margin);
-                p->setPen(opt->palette.light().color());
-                p->drawLine(rect.bottomLeft().x() + offset + 1,
-                            rect.bottomLeft().y() - margin,
-                            rect.topLeft().x() + offset + 1,
-                            rect.topLeft().y() + margin);
-            }
-            else{ //Draw vertical separator
-                const int offset = rect.height()/2;
-                p->setPen(opt->palette.dark().color());
-                p->drawLine(rect.topLeft().x() + margin ,
-                            rect.topLeft().y() + offset,
-                            rect.topRight().x() - margin,
-                            rect.topRight().y() + offset);
-                p->setPen(opt->palette.light().color());
-                p->drawLine(rect.topLeft().x() + margin ,
-                            rect.topLeft().y() + offset + 1,
-                            rect.topRight().x() - margin,
-                            rect.topRight().y() + offset + 1);
-            }
-            p->setPen(oldPen);
+    case PE_IndicatorToolBarSeparator: {
+        QPainterStateGuard psg(p);
+        const QRect &rect = opt->rect;
+        constexpr int margin = 2;
+        if (opt->state & State_Horizontal){
+            const int offset = rect.width() / 2;
+            const auto &tl = rect.topLeft();
+            const auto &bl = rect.bottomLeft();
+            p->setPen(opt->palette.dark().color());
+            p->drawLine(QLine(bl.x() + offset, bl.y() - margin,
+                              tl.x() + offset, tl.y() + margin));
+            p->setPen(opt->palette.light().color());
+            p->drawLine(QLine(bl.x() + offset + 1, bl.y() - margin,
+                              tl.x() + offset + 1, tl.y() + margin));
+        }
+        else{ //Draw vertical separator
+            const int offset = rect.height() / 2;
+            const auto &tl = rect.topLeft();
+            const auto &tr = rect.topRight();
+            p->setPen(opt->palette.dark().color());
+            p->drawLine(QLine(tl.x() + margin, tl.y() + offset,
+                              tr.x() - margin, tr.y() + offset));
+            p->setPen(opt->palette.light().color());
+            p->drawLine(QLine(tl.x() + margin, tl.y() + offset + 1,
+                              tr.x() - margin, tr.y() + offset + 1));
         }
         break;
-    case PE_IndicatorToolBarHandle:
-        p->save();
+    }
+    case PE_IndicatorToolBarHandle: {
+        QPainterStateGuard psg(p);
         p->translate(opt->rect.x(), opt->rect.y());
         if (opt->state & State_Horizontal) {
-            int x = opt->rect.width() / 2 - 4;
-            if (opt->direction == Qt::RightToLeft)
-                x -= 2;
             if (opt->rect.height() > 4) {
+                int x = opt->rect.width() / 2 - 4;
+                if (opt->direction == Qt::RightToLeft)
+                    x -= 2;
                 qDrawShadePanel(p, x, 2, 3, opt->rect.height() - 4,
                                 opt->palette, false, 1, nullptr);
                 qDrawShadePanel(p, x + 3, 2, 3, opt->rect.height() - 4,
@@ -650,9 +645,8 @@ void QWindowsStyle::drawPrimitive(PrimitiveElement pe, const QStyleOption *opt, 
                                 opt->palette, false, 1, nullptr);
             }
         }
-        p->restore();
         break;
-
+    }
 #endif // QT_CONFIG(toolbar)
     case PE_FrameButtonTool:
     case PE_PanelButtonTool: {
@@ -879,6 +873,13 @@ void QWindowsStyle::drawPrimitive(PrimitiveElement pe, const QStyleOption *opt, 
         }
 #ifndef QT_NO_FRAME
     case PE_Frame:
+        if (w && w->inherits("QComboBoxPrivateContainer")){
+            QStyleOption copy = *opt;
+            copy.state |= State_Raised;
+            proxy()->drawPrimitive(PE_PanelMenu, &copy, p, w);
+            break;
+        }
+        Q_FALLTHROUGH();
     case PE_FrameMenu:
         if (const QStyleOptionFrame *frame = qstyleoption_cast<const QStyleOptionFrame *>(opt)) {
             if (frame->lineWidth == 2 || pe == PE_Frame) {
@@ -901,6 +902,7 @@ void QWindowsStyle::drawPrimitive(PrimitiveElement pe, const QStyleOption *opt, 
             }
         } else {
             QPalette popupPal = opt->palette;
+            p->drawRect(opt->rect);
             popupPal.setColor(QPalette::Light, opt->palette.window().color());
             popupPal.setColor(QPalette::Midlight, opt->palette.light().color());
             qDrawWinPanel(p, opt->rect, popupPal, opt->state & State_Sunken);
@@ -927,6 +929,15 @@ void QWindowsStyle::drawPrimitive(PrimitiveElement pe, const QStyleOption *opt, 
                 p->drawRect(opt->rect);
         }
         break; }
+    case PE_PanelMenu:
+        if (w && w->inherits("QComboBoxPrivateContainer")){
+            const QBrush menuBackground = opt->palette.base().color();
+            QColor borderColor = opt->palette.window().color();
+            qDrawPlainRect(p, opt->rect, borderColor, 1, &menuBackground);
+        } else {
+            QCommonStyle::drawPrimitive(pe, opt, p, w);
+        }
+        break;
     case PE_FrameWindow: {
          QPalette popupPal = opt->palette;
          popupPal.setColor(QPalette::Light, opt->palette.window().color());
@@ -1166,23 +1177,24 @@ void QWindowsStyle::drawControl(ControlElement ce, const QStyleOption *opt, QPai
 #if QT_CONFIG(menubar)
     case CE_MenuBarItem:
         if (const QStyleOptionMenuItem *mbi = qstyleoption_cast<const QStyleOptionMenuItem *>(opt)) {
-            bool active = mbi->state & State_Selected;
-            bool hasFocus = mbi->state & State_HasFocus;
-            bool down = mbi->state & State_Sunken;
+            const bool active = mbi->state & State_Selected;
+            const QBrush buttonBrush = mbi->palette.brush(QPalette::Button);
             QStyleOptionMenuItem newMbi = *mbi;
-            p->fillRect(mbi->rect, mbi->palette.brush(QPalette::Button));
-            if (active || hasFocus) {
-                QBrush b = mbi->palette.brush(QPalette::Button);
-                if (active && down)
-                    p->setBrushOrigin(p->brushOrigin() + QPoint(1, 1));
-                if (active && hasFocus)
-                    qDrawShadeRect(p, mbi->rect.x(), mbi->rect.y(), mbi->rect.width(),
-                                   mbi->rect.height(), mbi->palette, active && down, 1, 0, &b);
-                if (active && down) {
-                    newMbi.rect.translate(proxy()->pixelMetric(PM_ButtonShiftHorizontal, mbi, widget),
-                                       proxy()->pixelMetric(PM_ButtonShiftVertical, mbi, widget));
-                    p->setBrushOrigin(p->brushOrigin() - QPoint(1, 1));
+            p->fillRect(mbi->rect, buttonBrush);
+            if (active) {
+                const bool hasFocus = mbi->state & State_HasFocus;
+                const bool down = mbi->state & State_Sunken;
+                QPainterStateGuard psg(p, QPainterStateGuard::InitialState::NoSave);
+                if (down) {
+                    psg.save();
+                    p->setBrushOrigin(p->brushOriginF() + QPointF(1, 1));
                 }
+                if (hasFocus)
+                    qDrawShadeRect(p, mbi->rect.x(), mbi->rect.y(), mbi->rect.width(),
+                                   mbi->rect.height(), mbi->palette, active && down, 1, 0, &buttonBrush);
+                if (down)
+                    newMbi.rect.translate(proxy()->pixelMetric(PM_ButtonShiftHorizontal, mbi, widget),
+                                          proxy()->pixelMetric(PM_ButtonShiftVertical, mbi, widget));
             }
             QCommonStyle::drawControl(ce, &newMbi, p, widget);
         }
