@@ -98,9 +98,11 @@ qt_internal_extend_target(QWindowsIntegrationPlugin CONDITION QT_FEATURE_opengl
         Qt::OpenGLPrivate
 )
 
-qt_internal_extend_target(QWindowsIntegrationPlugin CONDITION QT_FEATURE_opengl AND NOT QT_FEATURE_dynamicgl
+qt_internal_extend_target(QWindowsIntegrationPlugin CONDITION QT_FEATURE_egl
+    SOURCES
+        qwindowseglcontext.cpp qwindowseglcontext.h
     LIBRARIES
-        opengl32
+        EGL::EGL
 )
 
 qt_internal_extend_target(QWindowsIntegrationPlugin CONDITION MINGW
