@@ -2,11 +2,14 @@
 # Port this Windows 7 qtbase overlay from one Qt version to another.
 #
 #   tools/port_to_version.sh <from-tag> <to-tag> [workdir]
-#   tools/port_to_version.sh v6.10.0 v6.11.1
+#   tools/port_to_version.sh v6.11.1 v6.11.2
 #
 # Three-way merges every overlay file: ours = this repo's file, base = the
 # pristine qtbase file at <from-tag>, theirs = the pristine file at <to-tag>.
 # Files the overlay adds (restored from older Qt) are carried over untouched.
+# Every side is normalised to LF before merging, because the overlay is stored
+# with CRLF while qtbase is LF; without this every file conflicts spuriously.
+# The merged result is written with LF, so a ported branch is LF throughout.
 # Writes the result to <workdir>/out/qtbase and prints a per-file report;
 # copy it over qtbase/ once the conflicts are resolved by hand.
 set -u
@@ -17,22 +20,25 @@ WORK=${3:-$(dirname "$0")/../.port}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 
 mkdir -p "$WORK"
+WORK=$(cd "$WORK" && pwd)
 for tag in "$FROM" "$TO"; do
     if [ ! -d "$WORK/qtbase-$tag" ]; then
         echo "cloning pristine qtbase $tag ..."
-        git clone --depth 1 --branch "$tag" --single-branch \
+        git -c core.autocrlf=false clone --depth 1 --branch "$tag" --single-branch \
             https://github.com/qt/qtbase.git "$WORK/qtbase-$tag" || exit 1
     fi
 done
 
 OUT=$WORK/out/qtbase
-rm -rf "$OUT"; mkdir -p "$OUT"
+TMP=$WORK/tmp
+rm -rf "$OUT" "$TMP"; mkdir -p "$OUT" "$TMP"
 conflicts=0
 
 printf "%-62s %-10s %8s %8s\n" "FILE" "STATUS" "W7DELTA" "QTCHG"
 cd "$REPO/qtbase" || exit 1
 while read -r f; do
-    ours="$REPO/qtbase/$f"; base="$WORK/qtbase-$FROM/$f"; theirs="$WORK/qtbase-$TO/$f"
+    ours="$TMP/ours"; base="$WORK/qtbase-$FROM/$f"; theirs="$WORK/qtbase-$TO/$f"
+    tr -d '\r' < "$REPO/qtbase/$f" > "$ours"
     mkdir -p "$OUT/$(dirname "$f")"
     if [ ! -f "$base" ]; then                    # added by the overlay
         cp "$ours" "$OUT/$f"; st="NEW"; w7=$(wc -l < "$ours"); qt="-"
@@ -50,6 +56,7 @@ while read -r f; do
     fi
     printf "%-62s %-10s %8s %8s\n" "$f" "$st" "$w7" "$qt"
 done < <(find . -type f | sed 's|^\./||' | sort)
+rm -rf "$TMP"
 
 echo
 echo "result in $OUT ($conflicts file(s) with conflict markers)"
