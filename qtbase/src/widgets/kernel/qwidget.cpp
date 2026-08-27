@@ -5639,6 +5639,7 @@ void QWidgetPrivate::drawWidget(QPaintDevice *pdev, const QRegion &rgn, const QP
                 beginBackingStorePainting();
                 if (!q->testAttribute(Qt::WA_AlwaysStackOnTop) && repaintManager) {
                     QPainter p(q);
+                    p.setClipRegion(toBePainted);
                     p.setCompositionMode(QPainter::CompositionMode_Source);
                     p.fillRect(q->rect(), Qt::transparent);
                 } else if (!repaintManager) {
@@ -5649,6 +5650,7 @@ void QWidgetPrivate::drawWidget(QPaintDevice *pdev, const QRegion &rgn, const QP
                     if (img.format() == QImage::Format_RGB32)
                         img.reinterpretAsFormat(QImage::Format_ARGB32_Premultiplied);
                     QPainter p(q);
+                    p.setClipRegion(toBePainted);
                     p.drawImage(q->rect(), img);
                     skipPaintEvent = true;
                 }
