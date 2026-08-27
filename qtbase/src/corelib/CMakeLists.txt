@@ -355,7 +355,6 @@ qt_internal_add_module(Core
         kernel/qsocketnotifier.cpp # defines BUILDING_QSOCKETNOTIFIER
     DEFINES
         QT_NO_CONTEXTLESS_CONNECT
-        QT_NO_FOREACH
         QT_NO_QPAIR
         QT_NO_USING_NAMESPACE
         QT_TYPESAFE_FLAGS
@@ -1664,6 +1663,8 @@ qt_internal_extend_target(Core
         "_ZN*20QFutureInterfaceBase15setContinuationE*27QFutureInterfaceBasePrivate*"
         # QReadWriteLock::destroyRecursive(QReadWriteLockPrivate*)
         "_ZN*14QReadWriteLock16destroyRecursiveEP*21QReadWriteLockPrivate*"
+        # QUntypedPropertyBinding::QUntypedPropertyBinding(QPropertyBindingPrivate*)
+        "_ZN*23QUntypedPropertyBindingC1EP*23QPropertyBindingPrivate"
 )
 
 function(qt_internal_library_deprecation_level)
